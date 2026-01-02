@@ -27,14 +27,14 @@ class BASSConfig:
     # Audio/Encoder configuration
     freeze_encoder: bool = True
     input_dim: int = 40  # Mel spectrogram features dimension
-    encoder_dim: int = 2048  # Output dimension of pretrained ASR encoder
+    encoder_dim: int = 512  # Output dimension of pretrained ASR encoder
     
     # Block configuration
     block_size: int = 1000  # Number of frames per block
     block_overlap: int = 0  # Overlap between blocks (0 for no overlap)
     
     # Semantic context configuration
-    semantic_dim: int = 2048  # Dimension of semantic representation
+    semantic_dim: int = 512  # Dimension of semantic representation
     num_semantic_layers: int = 2  # Number of layers in semantic updater
     
     # Decoder configuration
@@ -142,7 +142,6 @@ class SemanticUpdater(nn.Module):
         # Combine with previous context if available
         if previous_semantic_context is not None:
             # Concatenate previous context with current aggregated representation
-            # 이전 컨텍스트는 상태로만 사용 (훈련 시, 옵션)
             if self.training and use_stop_gradient:
                 previous_semantic_context = previous_semantic_context.detach()
             combined_context = torch.cat([previous_semantic_context, aggregated_current], dim=1)
@@ -363,7 +362,7 @@ class BlockwiseDecoder(nn.Module):
                 logits = self.output_projection(dec_out[:, -1, :])  # [1, vocab]
                 return F.log_softmax(logits, dim=-1)                # [1, vocab]
 
-            # Beam search per sample (간단/안전 버전: batch를 샘플 단위로 루프)
+            # Beam search per sample 
             generated = []
             for b in range(batch_size):
                 # memory를 샘플별로 바꿔치기 해서 _next_logprobs가 쓰게 함
@@ -625,26 +624,19 @@ class BASSModel(nn.Module):
                 block_encoding, block_encoding_lengths = self.encoder(block_features, block_lengths)
 
             # Update semantic context: concat(prev, cur) 유지
-            # Note: previous_semantic_context는 이전 반복에서 설정됨
-            # use_context_carry=False면 이전 반복에서 None으로 설정되어 있음
             current_semantic_context = self.semantic_updater(
                 current_block_encoding=block_encoding,
                 previous_semantic_context=previous_semantic_context,
                 use_stop_gradient=getattr(self.config, "use_stop_gradient", False),
             )
 
-            # === 핵심: "previous block embedding만" 다음 블록에 전달 ===
             # current_semantic_context: [B, L, D] (보통 L=1 또는 2)
             prev_only = current_semantic_context[:, -1:, :]  # [B, 1, D]
 
-            # 디버깅/분석용으로 무엇을 저장할지 선택
-            # (논문 문장 그대로 가려면 prev_only 저장이 더 깔끔)
             # Only save contexts when not using per-block backward (to save memory)
             if not backward_per_block:
                 semantic_contexts.append(prev_only)
 
-            # 다음 블록에 들어갈 previous_semantic_context 설정
-            # carry ON일 때만 다음 블록으로 전달
             if getattr(self.config, "use_context_carry", True):
                 # IMPORTANT: Always detach when using backward_per_block to avoid OOM
                 # Per-block backward requires breaking gradient flow between blocks
@@ -655,8 +647,7 @@ class BASSModel(nn.Module):
             else:
                 previous_semantic_context = None
 
-            # Generate summary from current semantic context
-            # (decoder는 "현재 블록까지 반영된 컨텍스트"를 쓰는 게 맞으니 current_semantic_context 사용)
+            # Generate summary from current semantic context            
             if target_ids is not None:
                 # Training/validation with teacher forcing
                 block_logit = self.decoder(
